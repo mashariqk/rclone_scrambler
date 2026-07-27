@@ -1,7 +1,10 @@
 use crate::rclone::RcloneRunner;
 use chrono::{TimeZone, Utc};
-use rand::RngExt; // <-- Updated trait import for rand 0.10+
-use std::io::{self, Write};
+use rand::RngExt;
+use rayon::prelude::*;
+use std::io::{self, BufRead, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 pub fn run_scrambler(
     runner: &RcloneRunner,
@@ -9,40 +12,53 @@ pub fn run_scrambler(
     directory: &str,
     verbose: bool,
 ) -> Result<(), String> {
-    let files = runner.list_files(remote, directory)?;
+    let (mut child, reader) = runner.stream_files(remote, directory)?;
 
-    if files.is_empty() {
-        println!("No files found in the specified directory.");
-        return Ok(());
+    let count = AtomicUsize::new(0);
+    let output_lock = Mutex::new(()); // Prevents terminal text overlapping
+
+    // Process the streamed lines in parallel
+    reader
+        .lines()
+        .filter_map(Result::ok)
+        .filter(|line| !line.trim().is_empty())
+        .par_bridge() // <--- This hands off incoming lines to the thread pool instantly
+        .for_each(|file_path| {
+            // Generate random timestamp inside the thread
+            let mut rng = rand::rng();
+            let random_ts = rng.random_range(0..2_524_608_000);
+            let dt = Utc.timestamp_opt(random_ts, 0).unwrap();
+            let formatted_time = dt.format("%Y-%m-%dT%H:%M:%S").to_string();
+
+            if let Err(e) = runner.touch_file(remote, directory, &file_path, &formatted_time) {
+                let _lock = output_lock.lock().unwrap();
+                eprintln!("\nFailed to process '{}': {}", file_path, e);
+                return;
+            }
+
+            let current_count = count.fetch_add(1, Ordering::Relaxed) + 1;
+
+            // Secure terminal output so text doesn't tear
+            let _lock = output_lock.lock().unwrap();
+            if verbose {
+                println!("Modified: '{}' -> {}", file_path, formatted_time);
+            } else {
+                print!("\rFiles modified: {}", current_count);
+                let _ = io::stdout().flush();
+            }
+        });
+
+    let status = child.wait().map_err(|e| format!("Failed to wait on child: {}", e))?;
+    let final_count = count.load(Ordering::Relaxed);
+
+    if !verbose && final_count > 0 {
+        println!();
     }
 
-    let mut count = 0;
-    let total = files.len();
-
-    let mut rng = rand::rng();
-
-    for file in files {
-        // random_range is provided by the RngExt trait in rand 0.10+
-        let random_ts = rng.random_range(0..2_524_608_000);
-
-        let dt = Utc.timestamp_opt(random_ts, 0).unwrap();
-        // rclone touch format expects: YYYY-MM-DDTHH:MM:SS
-        let formatted_time = dt.format("%Y-%m-%dT%H:%M:%S").to_string();
-
-        if let Err(e) = runner.touch_file(remote, directory, &file.path, &formatted_time) {
-            eprintln!("\nFailed to process '{}': {}", file.path, e);
-            continue;
-        }
-
-        count += 1;
-
-        if verbose {
-            println!("Modified: '{}' -> {}", file.path, formatted_time);
-        } else {
-            // Overwrite the current line with the updated count
-            print!("\rFiles modified: {} / {}", count, total);
-            io::stdout().flush().unwrap();
-        }
+    if final_count == 0 {
+        println!("No files found, or directory does not exist.");
+    } else if !status.success() {
+        eprintln!("Warning: The rclone list process exited with status: {}", status);
     }
 
     Ok(())

@@ -1,13 +1,7 @@
 use crate::crypto::SecretString;
-use serde::Deserialize;
+use std::io;
 use std::path::PathBuf;
-use std::process::{Command, Output};
-
-#[derive(Deserialize)]
-pub struct RcloneFile {
-    #[serde(rename = "Path")]
-    pub path: String,
-}
+use std::process::{Command, Output, Child, Stdio};
 
 pub struct RcloneRunner {
     config_path: PathBuf,
@@ -22,13 +16,11 @@ impl RcloneRunner {
         }
     }
 
-    /// Builds a base command with the config file and password environment set
     fn base_cmd(&self) -> Command {
         let mut cmd = Command::new("rclone");
         cmd.arg("--config").arg(&self.config_path);
 
         if let Some(pw) = &self.password {
-            // This is only exposed to the specific child process, not globally
             cmd.env("RCLONE_CONFIG_PASS", pw.as_str());
         }
         cmd
@@ -57,23 +49,29 @@ impl RcloneRunner {
         Ok(remotes)
     }
 
-    pub fn list_files(&self, remote: &str, dir: &str) -> Result<Vec<RcloneFile>, String> {
+    /// Spawns an `rclone lsf` process and returns a reader to stream its output
+    pub fn stream_files(&self, remote: &str, dir: &str) -> Result<(Child, io::BufReader<std::process::ChildStdout>), String> {
         let target = if dir.is_empty() {
             format!("{}:", remote)
         } else {
             format!("{}:{}", remote, dir)
         };
 
-        let output = self
+        // We use 'lsf' to get raw paths line-by-line instead of loading massive JSON arrays
+        let mut child = self
             .base_cmd()
-            .arg("lsjson")
+            .arg("lsf")
             .arg(&target)
             .arg("-R") // Recursive
             .arg("--files-only")
-            .output();
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn rclone lsf: {}", e))?;
 
-        let stdout = Self::handle_output(output)?;
-        serde_json::from_str(&stdout).map_err(|e| format!("Failed to parse JSON: {}", e))
+        let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
+        let reader = io::BufReader::new(stdout);
+
+        Ok((child, reader))
     }
 
     pub fn touch_file(&self, remote: &str, dir: &str, file_path: &str, timestamp: &str) -> Result<(), String> {
@@ -94,4 +92,3 @@ impl RcloneRunner {
         Self::handle_output(output).map(|_| ())
     }
 }
-use std::io;

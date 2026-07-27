@@ -10,7 +10,12 @@ use std::process::exit;
 fn main() {
     let args = cli::Args::parse();
 
-    // 1. Determine if the config is encrypted and prompt for password securely
+    // Initialize the thread pool for parallel processing
+    if let Err(e) = rayon::ThreadPoolBuilder::new().num_threads(args.threads).build_global() {
+        eprintln!("Failed to initialize thread pool: {}", e);
+        exit(1);
+    }
+
     let password = match crypto::get_password_if_encrypted(&args.config) {
         Ok(Some(pw)) => Some(pw),
         Ok(None) => None,
@@ -22,7 +27,6 @@ fn main() {
 
     let rclone_runner = rclone::RcloneRunner::new(args.config.clone(), password);
 
-    // 2. Fetch and choose the remote
     println!("Fetching remotes...");
     let remotes = match rclone_runner.list_remotes() {
         Ok(r) => r,
@@ -46,15 +50,19 @@ fn main() {
 
     let selected_remote = &remotes[selection];
 
-    // 3. Ask for the directory path
     let directory: String = Input::new()
         .with_prompt(format!("Enter the directory path on '{}' (leave blank for root)", selected_remote))
         .allow_empty(true)
         .interact_text()
         .unwrap();
 
-    // 4. Scramble the files
-    println!("Fetching files list. This might take a moment...");
+    let target_path = if directory.is_empty() {
+        format!("{}:", selected_remote)
+    } else {
+        format!("{}:{}", selected_remote, directory)
+    };
+
+    println!("Fetching files from '{}' using {} threads. This might take a moment...", target_path, args.threads);
     if let Err(e) = scrambler::run_scrambler(&rclone_runner, selected_remote, &directory, args.verbose) {
         eprintln!("Error during scrambling process: {}", e);
         exit(1);
